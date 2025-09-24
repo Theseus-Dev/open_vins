@@ -1,0 +1,35 @@
+services:
+  kimera-amd64:
+    image: theseus-kimera
+    build: 
+      dockerfile: Dockerfile_22_04
+      platforms: 
+        - "linux/amd64"
+    platform: linux/amd64
+    volumes:
+      - .:/workspace/open-vins
+      - ../vns-sdk:/workspace/vns-sdk
+      - /home/eugene/Theseus/recordings:/recordings
+      # X11 forwarding volumes
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - /home/eugene/.Xauthority:/home/user/.Xauthority:ro
+      # GPU/DRI device access
+      - /dev/dri:/dev/dri
+    network_mode: host
+    ipc: host
+    pid: host
+    environment:
+      # Set display environment variable
+      - DISPLAY=${DISPLAY}
+      # Alternative if DISPLAY is not set: DISPLAY=:0
+    # Allow container to access X server
+    security_opt:
+      - seccomp:unconfined
+    group_add:
+      - video
+    # Run as current user to avoid permission issues
+    user: "${UID:-1000}:${GID:-1000}"
+    command: sleep infinity
+  
+
+# docker run -it --net=host --gpus all --env="NVIDIA_DRIVER_CAPABILITIES=all" --env="DISPLAY" --env="QT_X11_NO_MITSHM=1" --volume=/tmp/.X11-unix:/tmp/.X11-unix:rw --volume .:/catkin_ws/src/open_vins --volume /recordings:/datasets openvins bash

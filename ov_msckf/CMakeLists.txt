@@ -10,10 +10,13 @@ if (NOT OpenCV_FOUND)
 endif ()
 find_package(Boost REQUIRED COMPONENTS system filesystem thread date_time)
 find_package(Ceres REQUIRED)
+find_package(eCAL REQUIRED)
+find_package(CapnProto REQUIRED)
+find_library(VNS_CAPNP_LIB vns_capnp HINTS /workspace/vns-sdk/build-amd64/components/capnp REQUIRED)
 message(STATUS "OPENCV: " ${OpenCV_VERSION} " | BOOST: " ${Boost_VERSION} " | CERES: " ${Ceres_VERSION})
 
 # By default we build with ROS, but you can disable this and just build as a library
-option(ENABLE_ROS "Enable or disable building with ROS (if it is found)" ON)
+option(ENABLE_ROS "Enable or disable building with ROS (if it is found)" OFF)
 
 # If we will compile with aruco support
 option(ENABLE_ARUCO_TAGS "Enable or disable aruco tag (disable if no contrib modules)" ON)
@@ -52,5 +55,23 @@ else ()
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/ROS1.cmake)
 endif ()
 
+add_executable(ecal_vio examples/ecal_vio.cpp)
+target_link_libraries(ecal_vio
+    ov_msckf_lib
+    ${thirdparty_libraries}
+    eCAL::core
+    ${VNS_CAPNP_LIB}
+    CapnProto::kj
+    CapnProto::capnp
+)
+target_include_directories(ecal_vio
+    PUBLIC
+      /workspace/vns-sdk/build-amd64/generated/capnp
+  )
+install(TARGETS ecal_vio
+        ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+        LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+        RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
 
 

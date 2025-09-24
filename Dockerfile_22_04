@@ -1,0 +1,26 @@
+FROM ghcr.io/theseus-dev/amd-compile-amd64-builder
+
+RUN apt-get update && apt-get install -y cmake libgoogle-glog-dev libgflags-dev libatlas-base-dev libeigen3-dev libsuitesparse-dev libceres-dev sudo libboost-all-dev
+
+# ENV CERES_VERSION="2.2.0"
+# RUN git clone https://ceres-solver.googlesource.com/ceres-solver && \
+#     cd ceres-solver && \
+#     git checkout tags/${CERES_VERSION} && \
+#     mkdir build && cd build && \
+#     cmake .. -DCMAKE_BUILD_TYPE=RelWithDebugInfo && \
+#     make -j$(nproc) install && \
+#     rm -rf ../../ceres-solver
+
+# Accept build arguments for user creation
+ARG USER_ID=1000
+ARG GROUP_ID=1000
+ARG USERNAME=user
+
+# Create user with specified UID/GID
+RUN groupadd -g ${GROUP_ID} ${USERNAME} && \
+    useradd -u ${USER_ID} -g ${GROUP_ID} -m -s /bin/bash ${USERNAME} && \
+    echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers    
+
+# Set working directory and ownership
+WORKDIR /workspace
+RUN chown -R ${USERNAME}:${USERNAME} /workspace
