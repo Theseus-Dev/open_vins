@@ -16,7 +16,7 @@ find_library(VNS_CAPNP_LIB vns_capnp HINTS /workspace/vns-sdk/build-amd64/compon
 message(STATUS "OPENCV: " ${OpenCV_VERSION} " | BOOST: " ${Boost_VERSION} " | CERES: " ${Ceres_VERSION})
 
 # By default we build with ROS, but you can disable this and just build as a library
-option(ENABLE_ROS "Enable or disable building with ROS (if it is found)" OFF)
+option(ENABLE_ROS "Enable or disable building with ROS (if it is found)" ON)
 
 # If we will compile with aruco support
 option(ENABLE_ARUCO_TAGS "Enable or disable aruco tag (disable if no contrib modules)" ON)
@@ -56,6 +56,8 @@ else ()
 endif ()
 
 add_executable(ecal_vio examples/ecal_vio.cpp)
+# Add ROS2 dependencies for ecal_vio if ROS2 is available
+ament_target_dependencies(ecal_vio ${ament_libraries})
 target_link_libraries(ecal_vio
     ov_msckf_lib
     ${thirdparty_libraries}
@@ -68,6 +70,8 @@ target_include_directories(ecal_vio
     PUBLIC
       /workspace/vns-sdk/build-amd64/generated/capnp
   )
+
+
 install(TARGETS ecal_vio
         ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
         LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
