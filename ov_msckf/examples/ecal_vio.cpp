@@ -5,6 +5,8 @@
 #include <thread>
 #include <chrono>
 #include <opencv2/opencv.hpp>
+#include "types/IMU.h"
+#include "state/State.h"
 
 #include "core/VioManager.h"
 #include "core/VioManagerOptions.h"
@@ -22,6 +24,7 @@
 #include "imu.capnp.h"
 #include "image.capnp.h"
 #include "header.capnp.h"
+#include "odometry3d.capnp.h"
 
 using namespace ov_msckf;
 
@@ -55,7 +58,7 @@ public:
     // Initialize vectors for multiple cameras
     camera_subscribers_.resize(config_.camera_topics.size());
     buffered_images_.resize(config_.camera_topics.size());
-    buffered_timestamps_.resize(config_.camera_topics.size(), -1.0);
+    buffered_timestamps_.resize(config_.camera_topics.size(), 0);
     image_counts_.resize(config_.camera_topics.size(), 0);
 
     // Create camera subscribers
@@ -72,6 +75,13 @@ public:
       );
     }
 
+    // Create output publisher
+    output_publisher_ = std::make_unique<eCAL::CPublisher>("/vio", "capnp:Odometry3D", "OpenVINS VIO output");
+    if (!output_publisher_->IsCreated()) {
+      PRINT_ERROR(RED "Failed to create output publisher for topic: /vio/odometry\n" RESET);
+      return false;
+    }
+
     return true;
   }
 
@@ -86,19 +96,22 @@ private:
   cv::Mat convertImageMessage(const vkc::Image::Reader& image_msg);
   sensor_msgs::msg::Image::SharedPtr convertToRosImage(const vkc::Image::Reader& image_msg, const std::string& frame_id);
   void processCameraImages();
-  bool allCamerasSynchronized(double sync_threshold = 0.01);
+  void publishVioOutput();
 
   EcalConfig config_;
   std::shared_ptr<VioManager> sys_;
 
   std::unique_ptr<eCAL::CSubscriber> imu_subscriber_;
   std::vector<std::unique_ptr<eCAL::CSubscriber>> camera_subscribers_;
+  std::unique_ptr<eCAL::CPublisher> output_publisher_;
 
   std::vector<cv::Mat> buffered_images_;
-  std::vector<double> buffered_timestamps_;
+  std::vector<uint64_t> buffered_timestamps_;
+  sensor_msgs::msg::Image::SharedPtr buffered_ros_images_[2];
 
   size_t imu_message_count_ = 0;
   std::vector<size_t> image_counts_;
+  uint32_t seq_ = 0;
 };
 
 void signal_callback_handler(int signum) {
@@ -254,6 +267,12 @@ void EcalVioNode::onImageMessage(const char* topic_name,
     return;
   }
 
+  if (buffered_timestamps_[cam_idx] != 0)
+  {
+    PRINT_WARNING(YELLOW "Received double image on cam %u, dropping" RESET);
+    return;
+  }
+
   try {
     kj::ArrayPtr<const kj::byte> bytes(reinterpret_cast<const kj::byte*>(data->buf), data->size);
     kj::ArrayInputStream stream(bytes);
@@ -268,7 +287,7 @@ void EcalVioNode::onImageMessage(const char* topic_name,
 
     // Extract timestamp
     auto header = image_msg.getHeader();
-    double timestamp = (header.getStampMonotonic() + header.getClockOffset()) * 1e-9;
+    uint64_t timestamp = (header.getStampMonotonic() + header.getClockOffset());
 
     // Buffer the image for this camera
     buffered_images_[cam_idx] = image.clone();
@@ -278,40 +297,14 @@ void EcalVioNode::onImageMessage(const char* topic_name,
 
     // Create ROS2 image message for visualization
     sensor_msgs::msg::Image::SharedPtr ros_image = nullptr;
-    if (viz) {
+    // Only visualise up to the first two cameras
+    if (viz && cam_idx < 2) {
       std::string frame_id = "cam" + std::to_string(cam_idx);
-      ros_image = convertToRosImage(image_msg, frame_id);
+      buffered_ros_images_[cam_idx] = convertToRosImage(image_msg, frame_id);
     }
 
     // Try to process camera images if we have synchronized data
     processCameraImages();
-
-    // Call visualization callbacks with the image data
-    if (viz && ros_image) {
-      if (config_.camera_topics.size() == 1) {
-        // Monocular case
-        viz->callback_monocular(ros_image, static_cast<int>(cam_idx));
-      } else if (config_.camera_topics.size() == 2 && cam_idx < 2) {
-        // Store images for stereo callback
-        static sensor_msgs::msg::Image::SharedPtr buffered_ros_images[2] = {nullptr, nullptr};
-        buffered_ros_images[cam_idx] = ros_image;
-
-        // If we have both stereo images, call stereo callback
-        if (buffered_ros_images[0] && buffered_ros_images[1]) {
-          // Check if timestamps are synchronized (within 10ms)
-          double time_diff = std::abs(
-            (buffered_ros_images[0]->header.stamp.sec + buffered_ros_images[0]->header.stamp.nanosec * 1e-9) -
-            (buffered_ros_images[1]->header.stamp.sec + buffered_ros_images[1]->header.stamp.nanosec * 1e-9)
-          );
-
-          if (time_diff < 0.01) {
-            viz->callback_stereo(buffered_ros_images[0], buffered_ros_images[1], 0, 1);
-            buffered_ros_images[0] = nullptr;
-            buffered_ros_images[1] = nullptr;
-          }
-        }
-      }
-    }
 
     if (image_counts_[cam_idx] % 30 == 0) {
       PRINT_DEBUG("Received %zu frames from camera %zu\n", image_counts_[cam_idx], cam_idx);
@@ -327,7 +320,7 @@ ov_core::ImuData EcalVioNode::convertImuMessage(const vkc::Imu::Reader& imu_msg)
 
   // Extract timestamp from header (convert nanoseconds to seconds)
   auto header = imu_msg.getHeader();
-  measurement.timestamp = (header.getStampMonotonic() + header.getClockOffset()) * 1e-9;
+  measurement.timestamp = static_cast<double>(header.getStampMonotonic() + header.getClockOffset())/1e9;
 
   // Convert linear acceleration
   auto linear_acc = imu_msg.getLinearAcceleration();
@@ -397,6 +390,207 @@ cv::Mat EcalVioNode::convertImageMessage(const vkc::Image::Reader& image_msg) {
   return cv_image.clone();
 }
 
+
+
+void EcalVioNode::processCameraImages() {
+
+  // If not initialized, try to initialize using camera data
+  // if (!sys_->initialized()) {
+  //   // We need to attempt initialization, but first let's make sure we have valid data
+  //   // Find the first valid camera data for initialization attempt
+  //   for (size_t i = 0; i < buffered_images_.size(); ++i) {
+  //     if (!buffered_images_[i].empty() && buffered_timestamps_[i] > 0) {
+  //       // Validate image for initialization
+  //       if (buffered_images_[i].rows < 10 || buffered_images_[i].cols < 10 ||
+  //           buffered_images_[i].type() != CV_8UC1) {
+  //         continue; // Skip invalid images
+  //       }
+
+  //       ov_core::CameraData init_data;
+  //       init_data.timestamp = buffered_timestamps_[i];
+  //       init_data.sensor_ids.push_back(static_cast<int>(i));
+  //       init_data.images.push_back(buffered_images_[i].clone());
+  //       init_data.masks.push_back(cv::Mat::zeros(buffered_images_[i].size(), CV_8UC1));
+
+  //       try {
+  //         // This will call track_image_and_update which handles initialization internally
+  //         sys_->feed_measurement_camera(init_data);
+
+  //         // Only visualize after successful VIO processing, and only if initialized
+  //         if (viz && sys_->initialized()) {
+  //           try {
+  //             viz->visualize();
+  //           } catch (const std::exception& viz_e) {
+  //             PRINT_WARNING(YELLOW "Visualization exception during initialization: %s\n" RESET, viz_e.what());
+  //           }
+  //         }
+
+  //         // Clear this buffer after initialization attempt
+  //         buffered_timestamps_[i] = UINT64_MAX;
+  //       } catch (const std::exception& e) {
+  //         PRINT_ERROR(RED "Exception during VIO initialization: %s\n" RESET, e.what());
+  //       }
+
+  //       return; // Try one image at a time for initialization
+  //     }
+  //   }
+  //   return; // No valid images for initialization
+  // }
+
+  if (config_.camera_topics.size() == 1) {
+    ov_core::CameraData cam_data;
+    cam_data.timestamp = buffered_timestamps_[0] / 1e9;
+    cam_data.sensor_ids.push_back(0);
+    cam_data.images.push_back(buffered_images_[0].clone());
+    cam_data.masks.push_back(cv::Mat::zeros(buffered_images_[0].size(), CV_8UC1));
+
+    try {
+      // Feed to VIO system
+      sys_->feed_measurement_camera(cam_data);
+
+    } catch (const std::exception& e) {
+      PRINT_ERROR(RED "Exception in VIO processing: %s\n" RESET, e.what());
+    }
+
+    // Clear buffer
+    buffered_timestamps_[0] = 0;
+  }
+  // For multi-camera case, check synchronization
+  else {
+    // Find the most recent valid timestamp as reference
+    uint64_t min_ts = UINT64_MAX;
+    uint64_t max_ts = 0;
+    for (size_t buffered_timestamps_) {
+      min_ts = std::min(ts, min_ts);
+      max_ts = std::max(ts, max_ts);
+    }
+    if (min_ts == 0)
+    {
+      PRINT_DEBUG("Not yet data for all cameras\n");
+      return;
+    }
+    double diff =  static_cast<double>(max_ts - min_ts)/1e9;
+    if (diff >= 0.02)
+    {
+      PRINT_ERROR(RED "Cameras not synchronised, diff: %f\n" RESET, diff);
+      // drop earliest
+
+    }
+
+    ov_core::CameraData cam_data;
+    // Average of min and max ts
+    cam_data.timestamp = static_cast<double>(min_ts)/1e9 + diff / 2;
+
+    for (size_t idx = 0; idx < config_.camera_topics.size(); ++idx) {
+      cam_data.sensor_ids.push_back(static_cast<int>(idx));
+      cam_data.images.push_back(buffered_images_[idx].clone());
+      cam_data.masks.push_back(cv::Mat::zeros(buffered_images_[idx].size(), CV_8UC1));
+    }
+
+    try {
+      sys_->feed_measurement_camera(cam_data);
+
+    } catch (const std::exception& e) {
+      PRINT_ERROR(RED "Exception in multi-camera VIO processing: %s\n" RESET, e.what());
+    }
+
+    // Clear all buffers
+    for (size_t i = 0; i < buffered_timestamps_.size(); ++i) {
+      buffered_timestamps_[i] = 0;
+    }
+  }
+
+  publishVioOutput();
+
+  // Visualize the current state and features
+  if (viz) {
+    viz->visualize(); 
+    if (config_.camera_topics.size() == 1) {
+      // Monocular case
+      viz->callback_monocular(buffered_ros_images_[0], 0);
+    } else {
+      // Store images for stereo callback
+
+      viz->callback_stereo(buffered_ros_images_[0], buffered_ros_images_[1], 0, 1);
+    } 
+  }
+}
+
+
+void EcalVioNode::publishVioOutput() {
+  if (!output_publisher_ || !sys_ || !sys_->initialized()) {
+    return;
+  }
+
+  try {
+    // Get current state from OpenVINS
+    std::shared_ptr<ov_msckf::State> state = sys_->get_state();
+    if (!state) {
+      return;
+    }
+
+    // Get IMU state
+    std::shared_ptr<ov_type::IMU> imu_state = state->_imu;
+    if (!imu_state) {
+      return;
+    }
+
+    // Extract position (IMU to global frame)
+    Eigen::Vector3d pos_ItoG = imu_state->pos();
+
+    // Extract quaternion 
+    // TODO: check frame here
+    Eigen::Matrix<double, 4, 1> quat = imu_state->quat();
+
+    // Extract velocity (in global frame)
+    Eigen::Vector3d vel_IinG = imu_state->vel();
+
+    capnp::MallocMessageBuilder message;
+    vkc::Odometry3d::Builder odometry = message.initRoot<vkc::Odometry3d>();
+
+    // Set header information
+    auto header = odometry.initHeader();
+    header.setSeq(seq_++);
+    header.setStampMonotonic(state->_timestamp);
+
+    // Set position and orientation
+    auto pose = odometry.initPose();
+    auto position = pose.initPosition();
+    position.setX(pos_ItoG.x());
+    position.setY(pos_ItoG.y());
+    position.setZ(pos_ItoG.z());
+
+    // Set orientation quaternion (IMU to global frame)
+    auto orientation = pose.initOrientation();
+    orientation.setW(quat(3));
+    orientation.setX(quat(0));
+    orientation.setY(quat(1));
+    orientation.setZ(quat(2));
+
+    // Set linear velocity
+    auto twist = odometry.initTwist();
+    auto linear = twist.initLinear();
+    linear.setX(vel_IinG.x());
+    linear.setY(vel_IinG.y());
+    linear.setZ(vel_IinG.z());
+
+    // Angular velocity not directly available from state, set to zero for now
+    // auto angular = twist.initAngular();
+    // angular.setX(0.0);
+    // angular.setY(0.0);
+    // angular.setZ(0.0);
+
+    // Serialize and publish
+    kj::Array<capnp::word> words = capnp::messageToFlatArray(message);
+    kj::ArrayPtr<const char> array(reinterpret_cast<const char*>(words.begin()),
+                                   words.size() * sizeof(capnp::word));
+    output_publisher_->Send(array.begin(), array.size());
+
+  } catch (const std::exception& e) {
+    PRINT_ERROR(RED "Exception in VIO output publishing: %s\n" RESET, e.what());
+  }
+}
+
 sensor_msgs::msg::Image::SharedPtr EcalVioNode::convertToRosImage(const vkc::Image::Reader& image_msg, const std::string& frame_id) {
   // Get image properties
   uint32_t width = image_msg.getWidth();
@@ -434,204 +628,4 @@ sensor_msgs::msg::Image::SharedPtr EcalVioNode::convertToRosImage(const vkc::Ima
   memcpy(ros_image->data.data(), cv_image.data, data_size);
 
   return ros_image;
-}
-
-void EcalVioNode::processCameraImages() {
-  // Check if VIO system is valid and initialized
-  if (!sys_) {
-    PRINT_ERROR(RED "VIO system is null\n" RESET);
-    return;
-  }
-
-  // If not initialized, try to initialize using camera data
-  if (!sys_->initialized()) {
-    // We need to attempt initialization, but first let's make sure we have valid data
-    // Find the first valid camera data for initialization attempt
-    for (size_t i = 0; i < buffered_images_.size(); ++i) {
-      if (!buffered_images_[i].empty() && buffered_timestamps_[i] > 0) {
-        // Validate image for initialization
-        if (buffered_images_[i].rows < 10 || buffered_images_[i].cols < 10 ||
-            buffered_images_[i].type() != CV_8UC1) {
-          continue; // Skip invalid images
-        }
-
-        ov_core::CameraData init_data;
-        init_data.timestamp = buffered_timestamps_[i];
-        init_data.sensor_ids.push_back(static_cast<int>(i));
-        init_data.images.push_back(buffered_images_[i].clone());
-        init_data.masks.push_back(cv::Mat::zeros(buffered_images_[i].size(), CV_8UC1));
-
-        try {
-          // This will call track_image_and_update which handles initialization internally
-          sys_->feed_measurement_camera(init_data);
-
-          // Only visualize after successful VIO processing, and only if initialized
-          if (viz && sys_->initialized()) {
-            try {
-              viz->visualize();
-            } catch (const std::exception& viz_e) {
-              PRINT_WARNING(YELLOW "Visualization exception during initialization: %s\n" RESET, viz_e.what());
-            }
-          }
-
-          // Clear this buffer after initialization attempt
-          buffered_timestamps_[i] = -1;
-        } catch (const std::exception& e) {
-          PRINT_ERROR(RED "Exception during VIO initialization: %s\n" RESET, e.what());
-        }
-
-        return; // Try one image at a time for initialization
-      }
-    }
-    return; // No valid images for initialization
-  }
-
-  // Check if we have at least one camera with valid data
-  bool has_valid_data = false;
-  for (size_t i = 0; i < buffered_images_.size(); ++i) {
-    if (!buffered_images_[i].empty() && buffered_timestamps_[i] > 0) {
-      has_valid_data = true;
-      break;
-    }
-  }
-
-  if (!has_valid_data) {
-    return;
-  }
-
-  // For monocular case, process immediately
-  if (buffered_images_.size() == 1) {
-    if (!buffered_images_[0].empty() && buffered_timestamps_[0] > 0) {
-      // Validate image dimensions
-      if (buffered_images_[0].rows < 10 || buffered_images_[0].cols < 10) {
-        PRINT_ERROR(RED "Invalid image dimensions: %dx%d\n" RESET, buffered_images_[0].cols, buffered_images_[0].rows);
-        buffered_timestamps_[0] = -1;
-        return;
-      }
-
-      // Validate image data
-      if (buffered_images_[0].type() != CV_8UC1) {
-        PRINT_ERROR(RED "Invalid image type: %d (expected CV_8UC1=%d)\n" RESET, buffered_images_[0].type(), CV_8UC1);
-        buffered_timestamps_[0] = -1;
-        return;
-      }
-
-      ov_core::CameraData cam_data;
-      cam_data.timestamp = buffered_timestamps_[0];
-      cam_data.sensor_ids.push_back(0);
-      cam_data.images.push_back(buffered_images_[0].clone());
-      cam_data.masks.push_back(cv::Mat::zeros(buffered_images_[0].size(), CV_8UC1));
-
-      // Additional validation
-      if (cam_data.sensor_ids.size() != cam_data.images.size() ||
-          cam_data.images.size() != cam_data.masks.size()) {
-        PRINT_ERROR(RED "Camera data size mismatch: ids=%zu, images=%zu, masks=%zu\n" RESET,
-                   cam_data.sensor_ids.size(), cam_data.images.size(), cam_data.masks.size());
-        buffered_timestamps_[0] = -1;
-        return;
-      }
-
-      try {
-        // Feed to VIO system
-        sys_->feed_measurement_camera(cam_data);
-
-        // Visualize the current state and features
-        if (viz) {
-          viz->visualize();
-        }
-      } catch (const std::exception& e) {
-        PRINT_ERROR(RED "Exception in VIO processing: %s\n" RESET, e.what());
-      }
-
-      // Clear buffer
-      buffered_timestamps_[0] = -1;
-    }
-    return;
-  }
-
-  // For multi-camera case, check synchronization
-  if (allCamerasSynchronized()) {
-    // Use the first camera's timestamp as reference
-    double reference_timestamp = buffered_timestamps_[0];
-
-    ov_core::CameraData cam_data;
-    cam_data.timestamp = reference_timestamp;
-
-    // Add all synchronized cameras with validation
-    for (size_t i = 0; i < buffered_images_.size(); ++i) {
-      if (!buffered_images_[i].empty() && buffered_timestamps_[i] > 0) {
-        // Validate image dimensions and type
-        if (buffered_images_[i].rows < 10 || buffered_images_[i].cols < 10) {
-          PRINT_WARNING(YELLOW "Skipping camera %zu: invalid dimensions %dx%d\n" RESET,
-                       i, buffered_images_[i].cols, buffered_images_[i].rows);
-          continue;
-        }
-
-        if (buffered_images_[i].type() != CV_8UC1) {
-          PRINT_WARNING(YELLOW "Skipping camera %zu: invalid type %d (expected CV_8UC1=%d)\n" RESET,
-                       i, buffered_images_[i].type(), CV_8UC1);
-          continue;
-        }
-
-        cam_data.sensor_ids.push_back(static_cast<int>(i));
-        cam_data.images.push_back(buffered_images_[i].clone());
-        cam_data.masks.push_back(cv::Mat::zeros(buffered_images_[i].size(), CV_8UC1));
-      }
-    }
-
-    // Feed to VIO system if we have at least one valid camera
-    if (!cam_data.images.empty()) {
-      // Final validation
-      if (cam_data.sensor_ids.size() != cam_data.images.size() ||
-          cam_data.images.size() != cam_data.masks.size()) {
-        PRINT_ERROR(RED "Multi-camera data size mismatch: ids=%zu, images=%zu, masks=%zu\n" RESET,
-                   cam_data.sensor_ids.size(), cam_data.images.size(), cam_data.masks.size());
-      } else {
-        try {
-          sys_->feed_measurement_camera(cam_data);
-
-          // Visualize the current state and features
-          if (viz) {
-            viz->visualize();
-          }
-        } catch (const std::exception& e) {
-          PRINT_ERROR(RED "Exception in multi-camera VIO processing: %s\n" RESET, e.what());
-        }
-      }
-
-      // Clear all buffers
-      for (size_t i = 0; i < buffered_timestamps_.size(); ++i) {
-        buffered_timestamps_[i] = -1;
-      }
-    }
-  }
-}
-
-bool EcalVioNode::allCamerasSynchronized(double sync_threshold) {
-  // Find the first valid timestamp as reference
-  double reference_timestamp = -1;
-  for (size_t i = 0; i < buffered_timestamps_.size(); ++i) {
-    if (buffered_timestamps_[i] > 0 && !buffered_images_[i].empty()) {
-      reference_timestamp = buffered_timestamps_[i];
-      break;
-    }
-  }
-
-  if (reference_timestamp < 0) {
-    return false; // No valid timestamps
-  }
-
-  // Check if all cameras have data within sync threshold
-  size_t synchronized_cameras = 0;
-  for (size_t i = 0; i < buffered_timestamps_.size(); ++i) {
-    if (buffered_timestamps_[i] > 0 && !buffered_images_[i].empty() &&
-        std::abs(buffered_timestamps_[i] - reference_timestamp) < sync_threshold) {
-      synchronized_cameras++;
-    }
-  }
-
-  // For stereo, we need at least 2 cameras synchronized
-  // For mono, we need at least 1 camera
-  return (buffered_images_.size() == 1 && synchronized_cameras >= 1) ||
-         (buffered_images_.size() > 1 && synchronized_cameras >= 2);
 }
