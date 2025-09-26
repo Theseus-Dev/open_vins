@@ -4,6 +4,8 @@
 #include <atomic>
 #include <thread>
 #include <chrono>
+#include <deque>
+#include <mutex>
 #include <opencv2/opencv.hpp>
 #include "types/IMU.h"
 #include "state/State.h"
@@ -38,6 +40,17 @@ std::atomic<bool> shutdown_flag(false);
 struct EcalConfig {
   std::string imu_topic = "/imu0";
   std::vector<std::string> camera_topics;
+  size_t max_buffer_size = 2; // Maximum number of images to buffer per stream
+  double sync_tolerance_sec = 0.02; // Maximum time difference for synchronization
+};
+
+// Structure to hold buffered image data
+struct BufferedImage {
+  cv::Mat image;
+  uint64_t timestamp;
+  sensor_msgs::msg::Image::SharedPtr ros_image;
+
+  BufferedImage(const cv::Mat& img, uint64_t ts) : image(img.clone()), timestamp(ts), ros_image(nullptr) {}
 };
 
 class EcalVioNode {
@@ -57,8 +70,7 @@ public:
 
     // Initialize vectors for multiple cameras
     camera_subscribers_.resize(config_.camera_topics.size());
-    buffered_images_.resize(config_.camera_topics.size());
-    buffered_timestamps_.resize(config_.camera_topics.size(), 0);
+    image_buffers_.resize(config_.camera_topics.size());
     image_counts_.resize(config_.camera_topics.size(), 0);
 
     // Create camera subscribers
@@ -98,6 +110,11 @@ private:
   void processCameraImages();
   void publishVioOutput();
 
+  // Synchronization helper functions
+  uint64_t findSynchronizedImages(std::vector<size_t>& sync_indices);
+  void removeOldestImages();
+  void removeSynchronizedImages(const std::vector<size_t>& sync_indices);
+
   EcalConfig config_;
   std::shared_ptr<VioManager> sys_;
 
@@ -105,8 +122,8 @@ private:
   std::vector<std::unique_ptr<eCAL::CSubscriber>> camera_subscribers_;
   std::unique_ptr<eCAL::CPublisher> output_publisher_;
 
-  std::vector<cv::Mat> buffered_images_;
-  std::vector<uint64_t> buffered_timestamps_;
+  std::vector<std::deque<BufferedImage>> image_buffers_;
+  std::mutex buffer_mutex_;
   sensor_msgs::msg::Image::SharedPtr buffered_ros_images_[2];
 
   size_t imu_message_count_ = 0;
@@ -263,13 +280,7 @@ void EcalVioNode::onImuMessage(const char* topic_name,
 
 void EcalVioNode::onImageMessage(const char* topic_name,
                                 const struct eCAL::SReceiveCallbackData* data, size_t cam_idx) {
-  if (shutdown_flag.load() || !data || !data->buf || data->size == 0 || cam_idx >= buffered_images_.size()) {
-    return;
-  }
-
-  if (buffered_timestamps_[cam_idx] != 0)
-  {
-    PRINT_WARNING(YELLOW "Received double image on cam %u, dropping" RESET);
+  if (shutdown_flag.load() || !data || !data->buf || data->size == 0 || cam_idx >= image_buffers_.size()) {
     return;
   }
 
@@ -290,18 +301,26 @@ void EcalVioNode::onImageMessage(const char* topic_name,
     uint64_t timestamp = (header.getStampMonotonic() + header.getClockOffset());
 
     // Buffer the image for this camera
-    buffered_images_[cam_idx] = image.clone();
-    buffered_timestamps_[cam_idx] = timestamp;
+    {
+      std::lock_guard<std::mutex> lock(buffer_mutex_);
+
+      // Add new image to buffer
+      image_buffers_[cam_idx].emplace_back(image, timestamp);
+
+      // Create ROS2 image message for visualization (only for first two cameras)
+      if (viz && cam_idx < 2) {
+        std::string frame_id = "cam" + std::to_string(cam_idx);
+        image_buffers_[cam_idx].back().ros_image = convertToRosImage(image_msg, frame_id);
+      }
+
+      // Maintain buffer size limit
+      while (image_buffers_[cam_idx].size() > config_.max_buffer_size) {
+        image_buffers_[cam_idx].pop_front();
+        PRINT_WARNING(YELLOW "Buffer overflow for camera %zu, dropping oldest image\n" RESET, cam_idx);
+      }
+    }
 
     image_counts_[cam_idx]++;
-
-    // Create ROS2 image message for visualization
-    sensor_msgs::msg::Image::SharedPtr ros_image = nullptr;
-    // Only visualise up to the first two cameras
-    if (viz && cam_idx < 2) {
-      std::string frame_id = "cam" + std::to_string(cam_idx);
-      buffered_ros_images_[cam_idx] = convertToRosImage(image_msg, frame_id);
-    }
 
     // Try to process camera images if we have synchronized data
     processCameraImages();
@@ -393,111 +412,80 @@ cv::Mat EcalVioNode::convertImageMessage(const vkc::Image::Reader& image_msg) {
 
 
 void EcalVioNode::processCameraImages() {
-
-  // If not initialized, try to initialize using camera data
-  // if (!sys_->initialized()) {
-  //   // We need to attempt initialization, but first let's make sure we have valid data
-  //   // Find the first valid camera data for initialization attempt
-  //   for (size_t i = 0; i < buffered_images_.size(); ++i) {
-  //     if (!buffered_images_[i].empty() && buffered_timestamps_[i] > 0) {
-  //       // Validate image for initialization
-  //       if (buffered_images_[i].rows < 10 || buffered_images_[i].cols < 10 ||
-  //           buffered_images_[i].type() != CV_8UC1) {
-  //         continue; // Skip invalid images
-  //       }
-
-  //       ov_core::CameraData init_data;
-  //       init_data.timestamp = buffered_timestamps_[i];
-  //       init_data.sensor_ids.push_back(static_cast<int>(i));
-  //       init_data.images.push_back(buffered_images_[i].clone());
-  //       init_data.masks.push_back(cv::Mat::zeros(buffered_images_[i].size(), CV_8UC1));
-
-  //       try {
-  //         // This will call track_image_and_update which handles initialization internally
-  //         sys_->feed_measurement_camera(init_data);
-
-  //         // Only visualize after successful VIO processing, and only if initialized
-  //         if (viz && sys_->initialized()) {
-  //           try {
-  //             viz->visualize();
-  //           } catch (const std::exception& viz_e) {
-  //             PRINT_WARNING(YELLOW "Visualization exception during initialization: %s\n" RESET, viz_e.what());
-  //           }
-  //         }
-
-  //         // Clear this buffer after initialization attempt
-  //         buffered_timestamps_[i] = UINT64_MAX;
-  //       } catch (const std::exception& e) {
-  //         PRINT_ERROR(RED "Exception during VIO initialization: %s\n" RESET, e.what());
-  //       }
-
-  //       return; // Try one image at a time for initialization
-  //     }
-  //   }
-  //   return; // No valid images for initialization
-  // }
+  std::lock_guard<std::mutex> lock(buffer_mutex_);
 
   if (config_.camera_topics.size() == 1) {
+    // Single camera case - process oldest available image
+    if (image_buffers_[0].empty()) {
+      return;
+    }
+
+    const BufferedImage& buffered_img = image_buffers_[0].front();
+
     ov_core::CameraData cam_data;
-    cam_data.timestamp = buffered_timestamps_[0] / 1e9;
+    cam_data.timestamp = static_cast<double>(buffered_img.timestamp) / 1e9;
     cam_data.sensor_ids.push_back(0);
-    cam_data.images.push_back(buffered_images_[0].clone());
-    cam_data.masks.push_back(cv::Mat::zeros(buffered_images_[0].size(), CV_8UC1));
+    cam_data.images.push_back(buffered_img.image.clone());
+    cam_data.masks.push_back(cv::Mat::zeros(buffered_img.image.size(), CV_8UC1));
+
+    // Store ROS image for visualization
+    if (buffered_img.ros_image) {
+      buffered_ros_images_[0] = buffered_img.ros_image;
+    }
 
     try {
       // Feed to VIO system
       sys_->feed_measurement_camera(cam_data);
-
     } catch (const std::exception& e) {
       PRINT_ERROR(RED "Exception in VIO processing: %s\n" RESET, e.what());
     }
 
-    // Clear buffer
-    buffered_timestamps_[0] = 0;
+    // Remove processed image
+    image_buffers_[0].pop_front();
   }
-  // For multi-camera case, check synchronization
+  // Multi-camera case - find synchronized images
   else {
-    // Find the most recent valid timestamp as reference
-    uint64_t min_ts = UINT64_MAX;
-    uint64_t max_ts = 0;
-    for (size_t buffered_timestamps_) {
-      min_ts = std::min(ts, min_ts);
-      max_ts = std::max(ts, max_ts);
+    // Check if all cameras have at least one image
+    for (size_t i = 0; i < image_buffers_.size(); ++i) {
+      if (image_buffers_[i].empty()) {
+        return; // Wait for all cameras to have data
+      }
     }
-    if (min_ts == 0)
-    {
-      PRINT_DEBUG("Not yet data for all cameras\n");
+
+    // Find synchronized images using oldest timestamp from each camera
+    std::vector<size_t> sync_indices(image_buffers_.size(), 0);
+    uint64_t target_timestamp = findSynchronizedImages(sync_indices);
+
+    if (target_timestamp == 0) {
+      // No synchronized images found, remove oldest images to make progress
+      removeOldestImages();
       return;
     }
-    double diff =  static_cast<double>(max_ts - min_ts)/1e9;
-    if (diff >= 0.02)
-    {
-      PRINT_ERROR(RED "Cameras not synchronised, diff: %f\n" RESET, diff);
-      // drop earliest
 
-    }
-
+    // Create camera data with synchronized images
     ov_core::CameraData cam_data;
-    // Average of min and max ts
-    cam_data.timestamp = static_cast<double>(min_ts)/1e9 + diff / 2;
+    cam_data.timestamp = static_cast<double>(target_timestamp) / 1e9;
 
-    for (size_t idx = 0; idx < config_.camera_topics.size(); ++idx) {
+    for (size_t idx = 0; idx < image_buffers_.size(); ++idx) {
+      const BufferedImage& sync_img = image_buffers_[idx][sync_indices[idx]];
       cam_data.sensor_ids.push_back(static_cast<int>(idx));
-      cam_data.images.push_back(buffered_images_[idx].clone());
-      cam_data.masks.push_back(cv::Mat::zeros(buffered_images_[idx].size(), CV_8UC1));
+      cam_data.images.push_back(sync_img.image.clone());
+      cam_data.masks.push_back(cv::Mat::zeros(sync_img.image.size(), CV_8UC1));
+
+      // Store ROS images for visualization (first two cameras)
+      if (idx < 2 && sync_img.ros_image) {
+        buffered_ros_images_[idx] = sync_img.ros_image;
+      }
     }
 
     try {
       sys_->feed_measurement_camera(cam_data);
-
     } catch (const std::exception& e) {
       PRINT_ERROR(RED "Exception in multi-camera VIO processing: %s\n" RESET, e.what());
     }
 
-    // Clear all buffers
-    for (size_t i = 0; i < buffered_timestamps_.size(); ++i) {
-      buffered_timestamps_[i] = 0;
-    }
+    // Remove processed images
+    removeSynchronizedImages(sync_indices);
   }
 
   publishVioOutput();
@@ -628,4 +616,83 @@ sensor_msgs::msg::Image::SharedPtr EcalVioNode::convertToRosImage(const vkc::Ima
   memcpy(ros_image->data.data(), cv_image.data, data_size);
 
   return ros_image;
+}
+
+uint64_t EcalVioNode::findSynchronizedImages(std::vector<size_t>& sync_indices) {
+  // Find the oldest timestamp among all first images in each buffer
+  uint64_t oldest_timestamp = UINT64_MAX;
+  for (size_t cam = 0; cam < image_buffers_.size(); ++cam) {
+    if (!image_buffers_[cam].empty()) {
+      oldest_timestamp = std::min(oldest_timestamp, image_buffers_[cam][0].timestamp);
+    }
+  }
+
+  if (oldest_timestamp == UINT64_MAX) {
+    return 0; // No images available
+  }
+
+  // For each camera, find the image closest to the oldest timestamp
+  double sync_tolerance_ns = config_.sync_tolerance_sec * 1e9;
+  bool all_synchronized = true;
+
+  for (size_t cam = 0; cam < image_buffers_.size(); ++cam) {
+    bool found_sync = false;
+
+    for (size_t i = 0; i < image_buffers_[cam].size(); ++i) {
+      double time_diff = std::abs(static_cast<double>(image_buffers_[cam][i].timestamp) -
+                                  static_cast<double>(oldest_timestamp));
+
+      if (time_diff <= sync_tolerance_ns) {
+        sync_indices[cam] = i;
+        found_sync = true;
+        break;
+      }
+    }
+
+    if (!found_sync) {
+      all_synchronized = false;
+      break;
+    }
+  }
+
+  if (!all_synchronized) {
+    PRINT_WARNING(YELLOW "Could not find synchronized images within tolerance of %.3f ms\n" RESET, 
+                config_.sync_tolerance_sec * 1000.0);
+    return 0;
+  }
+
+  return oldest_timestamp;
+}
+
+void EcalVioNode::removeOldestImages() {
+  // Find camera with oldest image and remove it
+  uint64_t oldest_timestamp = UINT64_MAX;
+  size_t oldest_cam = 0;
+
+  for (size_t cam = 0; cam < image_buffers_.size(); ++cam) {
+    if (!image_buffers_[cam].empty() && image_buffers_[cam][0].timestamp < oldest_timestamp) {
+      oldest_timestamp = image_buffers_[cam][0].timestamp;
+      oldest_cam = cam;
+    }
+  }
+
+  if (oldest_timestamp != UINT64_MAX) {
+    image_buffers_[oldest_cam].pop_front();
+    PRINT_DEBUG("Removed oldest unsynchronized image from camera %zu\n", oldest_cam);
+  }
+}
+
+void EcalVioNode::removeSynchronizedImages(const std::vector<size_t>& sync_indices) {
+  // Remove synchronized images from each buffer
+  // Note: Remove in reverse order of indices to avoid index shifting issues
+  for (size_t cam = 0; cam < image_buffers_.size(); ++cam) {
+    if (sync_indices[cam] < image_buffers_[cam].size()) {
+      // Remove elements from front up to and including the synchronized index
+      for (size_t i = 0; i <= sync_indices[cam]; ++i) {
+        if (!image_buffers_[cam].empty()) {
+          image_buffers_[cam].pop_front();
+        }
+      }
+    }
+  }
 }
